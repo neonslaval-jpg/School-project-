@@ -26,8 +26,8 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("⚡ UniAlgo: Scanner & Simulator")
-st.caption("Strategy: Volatility Compression Swing (Strong Buy Logic)")
+st.title("⚡ UniAlgo: High-Probability Scanner")
+st.caption("Strategy: Volatility Compression Swing (Stricter Filter for Higher Win Rate)")
 
 # -----------------------------------------------------------------------------
 # 2. TICKER UNIVERSE (S&P 500 + TSX 60)
@@ -92,7 +92,7 @@ ALL_TICKERS = TSX_TICKERS + US_TICKERS
 # 3. DATA CACHING & HELPERS
 # -----------------------------------------------------------------------------
 
-@st.cache_data(ttl=3600) # Cache data for 1 hour to prevent constant reloading
+@st.cache_data(ttl=3600) # Cache data for 1 hour
 def fetch_data():
     return yf.download(ALL_TICKERS, period="2y", group_by='ticker', auto_adjust=True, threads=True)
 
@@ -100,46 +100,124 @@ def calculate_indicators(df):
     if df.empty or len(df) < 205: return df
     df = df.copy()
     
+    # 1. Trend
     df['SMA_200'] = df['Close'].rolling(window=200).mean()
+    
+    # 2. Pullback
     df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
     
+    # 3. RSI
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
     
+    # 4. ATR (Risk)
     high_low = df['High'] - df['Low']
-    true_range = np.maximum(high_low, np.abs(df['High'] - df['Close'].shift()))
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = np.max(ranges, axis=1)
     df['ATR'] = true_range.rolling(window=14).mean()
     
-    # Simple ADX Approximation for speed/stability
-    df['ADX'] = df['ATR'].rolling(14).mean() # (Simplified for batch speed)
-    
-    # If possible, use real ADX logic if compute allows:
-    # plus_dm = df['High'].diff()
-    # minus_dm = df['Low'].diff()
-    # plus_dm[plus_dm < 0] = 0
-    # minus_dm[minus_dm > 0] = 0
-    # plus_di = 100 * (plus_dm.ewm(alpha=1/14).mean() / df['ATR'])
-    # minus_di = 100 * (np.abs(minus_dm).ewm(alpha=1/14).mean() / df['ATR'])
-    # dx = (np.abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
-    # df['ADX'] = dx.rolling(window=14).mean()
+    # 5. ADX (Approx calculation for speed/batch)
+    # Using Rolling ATR approximation to avoid complex loop overhead
+    # Note: For strict ADX logic, we use this approx as proxy for Trend Strength
+    plus_dm = df['High'].diff()
+    minus_dm = df['Low'].diff()
+    plus_dm[plus_dm < 0] = 0
+    minus_dm[minus_dm > 0] = 0
+    plus_di = 100 * (plus_dm.ewm(alpha=1/14).mean() / df['ATR'])
+    minus_di = 100 * (np.abs(minus_dm).ewm(alpha=1/14).mean() / df['ATR'])
+    dx = (np.abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
+    df['ADX'] = dx.rolling(window=14).mean()
 
     return df
 
 # -----------------------------------------------------------------------------
-# 4. APP INTERFACE
+# 4. TRADING LOGIC (STRICT / HIGH PROBABILITY)
+# -----------------------------------------------------------------------------
+def analyze_stock(ticker, df):
+    if df.empty or len(df) < 205: return None
+    if 'SMA_200' not in df.columns: return None
+        
+    curr = df.iloc[-1]
+    prev = df.iloc[-2]
+    
+    # --- 1. STRICTER GATES ---
+    # Trend: Price > SMA200 AND ADX > 20 (Was 15) - Stricter
+    is_uptrend = (curr['Close'] > curr['SMA_200']) and (curr['ADX'] > 20)
+    
+    # Pullback: Price near EMA20 AND RSI < 55 (Was 60) - Stricter
+    dist_to_ema = (curr['Close'] - curr['EMA_20']) / curr['EMA_20']
+    is_pullback = (abs(dist_to_ema) < 0.03) and (curr['RSI'] < 55)
+    
+    if not (is_uptrend and is_pullback): return None
+
+    # --- 2. TRIGGER CLASSIFICATION ---
+    avg_vol = df['Volume'].rolling(20).mean().iloc[-1]
+    if pd.isna(avg_vol) or avg_vol == 0: avg_vol = 1
+    
+    status = "WATCH"
+    reason = "Setup Valid (Waiting for Trigger)"
+    
+    # POWER CLOSE LOGIC: Close in top 25% of daily range
+    day_range = curr['High'] - curr['Low']
+    if day_range == 0: day_range = 0.01
+    close_strength = (curr['Close'] - curr['Low']) / day_range
+    is_power_close = close_strength > 0.75
+
+    # BREAKOUT LOGIC: Close > Prev High
+    breakout = curr['Close'] > prev['High']
+    
+    # VOLUME LOGIC: > 100% of Avg (Institutions Active)
+    vol_confirm = curr['Volume'] > avg_vol
+
+    # --- DECISION TREE ---
+    
+    # Standard Buy: Breakout + Power Close (Vol optional but preferred)
+    if breakout and is_power_close:
+        status = "BUY"
+        reason = "Valid: Trend(20+) + Power Close"
+        
+        # Strong Buy: Needs Volume + Higher ADX
+        if vol_confirm and (curr['ADX'] > 25):
+            status = "STRONG BUY"
+            reason = "🔥 High Conviction: ADX>25 + Vol Spike + Power Close"
+
+    # --- 3. OUTPUT ---
+    if status in ["STRONG BUY", "BUY", "WATCH"]:
+        stop = curr['Close'] - (2 * curr['ATR'])
+        target = curr['Close'] + (3 * curr['ATR'])
+        
+        return {
+            "Ticker": ticker, 
+            "Status": status, 
+            "Price": curr['Close'],
+            "Stop": stop, 
+            "Target": target, 
+            "RSI": curr['RSI'],
+            "ADX": curr['ADX'],
+            "ATR": curr['ATR'],
+            "SMA200": curr['SMA_200'],
+            "EMA20": curr['EMA_20'],
+            "Reason": reason
+        }
+    return None
+
+# -----------------------------------------------------------------------------
+# 5. APP INTERFACE
 # -----------------------------------------------------------------------------
 
 tab1, tab2 = st.tabs(["🚀 LIVE SCANNER", "🔙 BACKTEST SIMULATOR"])
 
 # =============================================================================
-# TAB 1: LIVE SCANNER (For Finding Trades Today)
+# TAB 1: LIVE SCANNER
 # =============================================================================
 with tab1:
     st.header("Daily Swing Scanner")
-    st.write("Finds stocks setting up for a trade **today**.")
+    st.write("Finds stocks setting up for a trade **today** using High-Probability logic.")
     
     if st.button("RUN SCANNER", key="btn_scan"):
         status_text = st.empty()
@@ -159,40 +237,9 @@ with tab1:
                     else: df = data[ticker].dropna()
                     
                     df = calculate_indicators(df)
+                    signal = analyze_stock(ticker, df)
                     
-                    # --- SCAN LOGIC ---
-                    if len(df) < 205: continue
-                    curr = df.iloc[-1]
-                    prev = df.iloc[-2]
-                    
-                    # Gates
-                    is_uptrend = (curr['Close'] > curr['SMA_200']) 
-                    dist = (curr['Close'] - curr['EMA_20']) / curr['EMA_20']
-                    is_pullback = (abs(dist) < 0.03) and (curr['RSI'] < 60)
-                    
-                    if is_uptrend and is_pullback:
-                        
-                        # Triggers
-                        avg_vol = df['Volume'].rolling(20).mean().iloc[-1]
-                        if pd.isna(avg_vol) or avg_vol == 0: avg_vol = 1
-                        
-                        basic_trigger = (curr['Close'] > curr['Open']) or (curr['Close'] > prev['High'])
-                        
-                        # Strong Buy Logic
-                        # Note: Using approximated ADX/Vol logic for robustness
-                        strong = (curr['Close'] > prev['High']) and (curr['Volume'] > avg_vol)
-                        
-                        status = "WATCH"
-                        if basic_trigger: status = "BUY"
-                        if basic_trigger and strong: status = "STRONG BUY"
-                        
-                        stop = curr['Close'] - (2 * curr['ATR'])
-                        target = curr['Close'] + (3 * curr['ATR'])
-                        
-                        results.append({
-                            "Ticker": ticker, "Status": status, "Price": curr['Close'],
-                            "Stop": stop, "Target": target, "RSI": curr['RSI']
-                        })
+                    if signal: results.append(signal)
                 except: continue
                 
                 count += 1
@@ -202,7 +249,7 @@ with tab1:
             status_text.empty()
             
             if not results:
-                st.warning("No setups found today.")
+                st.warning("No setups found today. Stricter filters active.")
             else:
                 # Sort: Strong Buy -> Buy -> Watch
                 def sort_prio(s):
@@ -215,19 +262,12 @@ with tab1:
                 
                 c1, c2 = st.columns(2)
                 for i, res in enumerate(results):
-                    # Colors
                     if res['Status'] == "STRONG BUY": 
-                        bd = "#00E676" 
-                        icon = "🔥"
-                        bg = "#1E3A2F"
+                        bd, icon, bg = "#00E676", "🔥", "#1E3A2F"
                     elif res['Status'] == "BUY": 
-                        bd = "#4CAF50"
-                        icon = "🟢"
-                        bg = "#262730"
+                        bd, icon, bg = "#4CAF50", "🟢", "#262730"
                     else: 
-                        bd = "#FFC107"
-                        icon = "👀"
-                        bg = "#262730"
+                        bd, icon, bg = "#FFC107", "👀", "#262730"
                         
                     html = f"""
                     <div style="background-color:{bg}; padding:10px; border-radius:10px; border-left:5px solid {bd}; margin-bottom:10px;">
@@ -242,23 +282,24 @@ with tab1:
                             st.write(f"**Stop:** ${res['Stop']:.2f}")
                             st.write(f"**Target:** ${res['Target']:.2f}")
                             st.write(f"**RSI:** {res['RSI']:.1f}")
+                            st.caption(res['Reason'])
 
         except Exception as e:
             st.error(f"Error: {e}")
 
 # =============================================================================
-# TAB 2: BACKTEST SIMULATOR (For Proving Performance)
+# TAB 2: BACKTEST SIMULATOR
 # =============================================================================
 with tab2:
     st.header("Backtest Simulator")
-    st.write("Simulates how 'STRONG BUY' signals from the **last 10 days** are performing right now.")
+    st.write("Simulates how **High Conviction** signals performed over the last 10 days.")
     
     if st.button("RUN SIMULATION", key="btn_backtest"):
         status_text = st.empty()
         status_text.write("⏳ Re-using Cached Data...")
         
         try:
-            data = fetch_data() # Uses cache!
+            data = fetch_data()
             trades = []
             
             progress_bar = st.progress(0)
@@ -278,21 +319,32 @@ with tab2:
                         prev = df.iloc[i-1]
                         future_prices = df.iloc[i+1:]
                         
-                        # Logic (Strict Strong Buy)
-                        is_uptrend = (curr['Close'] > curr['SMA_200']) 
+                        # --- BACKTEST LOGIC (REPLICATING ANALYZE_STOCK) ---
+                        is_uptrend = (curr['Close'] > curr['SMA_200']) and (curr['ADX'] > 20)
                         dist = (curr['Close'] - curr['EMA_20']) / curr['EMA_20']
-                        is_pullback = (abs(dist) < 0.03) and (curr['RSI'] < 60)
-                        trigger = (curr['Close'] > prev['High']) # Strong Trigger
+                        is_pullback = (abs(dist) < 0.03) and (curr['RSI'] < 55)
                         
-                        if is_uptrend and is_pullback and trigger:
+                        # Triggers
+                        avg_vol = df['Volume'].rolling(20).mean().iloc[i]
+                        day_range = curr['High'] - curr['Low']
+                        if day_range == 0: day_range = 0.01
+                        close_strength = (curr['Close'] - curr['Low']) / day_range
+                        
+                        breakout = curr['Close'] > prev['High']
+                        is_power_close = close_strength > 0.75
+                        vol_confirm = curr['Volume'] > avg_vol
+                        
+                        # STRICT FILTER: Only testing "Strong Buy" scenarios
+                        # Must have: Uptrend + Pullback + Breakout + PowerClose + Vol + ADX>25
+                        if is_uptrend and is_pullback and breakout and is_power_close and vol_confirm and (curr['ADX'] > 25):
+                            
                             entry_price = curr['Close']
                             stop_loss = entry_price - (2 * curr['ATR'])
                             target = entry_price + (3 * curr['ATR'])
                             
                             outcome = "OPEN"
-                            exit_price = df.iloc[-1]['Close'] # Current Price
+                            exit_price = df.iloc[-1]['Close']
                             
-                            # Check Future Outcome
                             for date, row in future_prices.iterrows():
                                 if row['Low'] < stop_loss:
                                     outcome = "STOPPED"
@@ -322,11 +374,10 @@ with tab2:
             status_text.empty()
             
             if not trades:
-                st.info("No Strong Buy signals found in the last 10 days.")
+                st.info("No Strong Buy signals found in the last 10 days using stricter filters.")
             else:
                 df_res = pd.DataFrame(trades)
                 
-                # --- SUMMARY METRICS ---
                 avg_ret = df_res['Return %'].mean()
                 win_rate = len(df_res[df_res['Return %'] > 0]) / len(df_res) * 100
                 
@@ -339,7 +390,6 @@ with tab2:
                 st.divider()
                 st.write("### Trade Log")
                 
-                # Color code outcomes
                 def highlight_outcome(val):
                     color = 'green' if val == 'TARGET' else 'red' if val == 'STOPPED' else 'orange'
                     return f'color: {color}; font-weight: bold'
@@ -352,3 +402,4 @@ with tab2:
 
         except Exception as e:
             st.error(f"Error: {e}")
+
