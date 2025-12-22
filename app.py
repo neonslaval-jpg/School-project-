@@ -11,34 +11,18 @@ st.set_page_config(page_title="UniAlgo Pro", page_icon="⚡", layout="wide")
 
 st.markdown("""
 <style>
-    .trade-card {
+    .stExpander {
         background-color: #262730;
-        padding: 15px;
         border-radius: 10px;
-        border-left: 5px solid #4CAF50;
-        margin-bottom: 10px;
-    }
-    .watchlist-card {
-        background-color: #262730;
-        padding: 15px;
-        border-radius: 10px;
-        border-left: 5px solid #FFC107;
-        margin-bottom: 10px;
-    }
-    .metric-container {
-        background-color: #333;
-        padding: 10px;
-        border-radius: 5px;
-        margin: 5px 0;
     }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("⚡ 500-Stock Market Scanner")
-st.caption("Universities: S&P 500 (US) + TSX 60 (Canada)")
+st.caption("Universities: S&P 500 (US) + TSX 60 (Canada) | Logic: Volatility Compression Swing")
 
 # -----------------------------------------------------------------------------
-# 2. TICKER UNIVERSE (Hardcoded)
+# 2. TICKER UNIVERSE
 # -----------------------------------------------------------------------------
 TSX_TICKERS = [
     "RY.TO", "TD.TO", "CNR.TO", "CP.TO", "ENB.TO", "BNS.TO", "CNQ.TO", "BMO.TO",
@@ -88,6 +72,7 @@ US_TICKERS = [
     "MOS", "NCLH", "NI", "NRG", "NWS", "NWSA", "OGN", "PARA", "PEAK", "PNR", "PNW",
     "PVH", "QRVO", "RCL", "REG", "RHI", "SEE", "SIVB", "SPG", "TPR", "UAA", "UA"
 ]
+
 ALL_TICKERS = TSX_TICKERS + US_TICKERS
 
 # -----------------------------------------------------------------------------
@@ -95,31 +80,26 @@ ALL_TICKERS = TSX_TICKERS + US_TICKERS
 # -----------------------------------------------------------------------------
 def calculate_indicators(df):
     if df.empty or len(df) < 205: return df
-    
     df = df.copy()
     
-    # 200 SMA (Trend)
+    # Trend
     df['SMA_200'] = df['Close'].rolling(window=200).mean()
-    
-    # 20 EMA (Pullback)
+    # Pullback
     df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
-    
-    # RSI 14
+    # RSI
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
-    
-    # ATR 14
+    # ATR (Risk)
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
     ranges = pd.concat([high_low, high_close, low_close], axis=1)
     true_range = np.max(ranges, axis=1)
     df['ATR'] = true_range.rolling(window=14).mean()
-    
-    # ADX 14
+    # ADX (Strength)
     plus_dm = df['High'].diff()
     minus_dm = df['Low'].diff()
     plus_dm[plus_dm < 0] = 0
@@ -132,7 +112,7 @@ def calculate_indicators(df):
     return df
 
 # -----------------------------------------------------------------------------
-# 4. TRADING LOGIC
+# 4. TRADING LOGIC (Strong Buy vs Buy)
 # -----------------------------------------------------------------------------
 def analyze_stock(ticker, df):
     if df.empty or len(df) < 205: return None
@@ -141,48 +121,44 @@ def analyze_stock(ticker, df):
     curr = df.iloc[-1]
     prev = df.iloc[-2]
     
-    # --- Logic ---
+    # 1. Base Gates
     is_uptrend = (curr['Close'] > curr['SMA_200']) and (curr['ADX'] > 15)
     dist_to_ema = (curr['Close'] - curr['EMA_20']) / curr['EMA_20']
     is_pullback = (abs(dist_to_ema) < 0.03) and (curr['RSI'] < 60)
-    is_trigger = (curr['Close'] > prev['High']) or (curr['Close'] > curr['Open'])
     
+    if not (is_uptrend and is_pullback): return None
+
+    # 2. Classification
     avg_vol = df['Volume'].rolling(20).mean().iloc[-1]
     if pd.isna(avg_vol) or avg_vol == 0: avg_vol = 1
-    vol_valid = curr['Volume'] > (avg_vol * 0.7)
-
-    status = "WAIT"
-    reason = ""
     
-    if is_uptrend:
-        if is_pullback:
-            if is_trigger and vol_valid:
-                status = "BUY"
-                reason = "Trend + Pullback + Trigger"
-            else:
-                status = "WATCH"
-                reason = "Setup Valid (Wait for Trigger)"
-        else:
-            return None 
-    else:
-        return None
+    status = "WATCH"
+    reason = "Setup Valid (Waiting for Trigger)"
+    
+    basic_trigger = (curr['Close'] > curr['Open']) or (curr['Close'] > prev['High'])
+    basic_vol = curr['Volume'] > (avg_vol * 0.7)
+    
+    if basic_trigger and basic_vol:
+        status = "BUY"
+        reason = "Standard: Trend + Pullback + Reversal"
 
-    if status in ["BUY", "WATCH"]:
+        # Strong Buy Logic
+        strong_trend = curr['ADX'] > 25
+        strong_trigger = curr['Close'] > prev['High']
+        strong_vol = curr['Volume'] > avg_vol
+        
+        if strong_trend and strong_trigger and strong_vol:
+            status = "STRONG BUY"
+            reason = "🔥 High Conviction: Strong Trend + Vol Spike"
+
+    if status in ["STRONG BUY", "BUY", "WATCH"]:
         stop = curr['Close'] - (2 * curr['ATR'])
         target = curr['Close'] + (3 * curr['ATR'])
-        
-        # Return ALL indicators for display
         return {
-            "Ticker": ticker, 
-            "Status": status, 
-            "Price": curr['Close'],
-            "Stop": stop, 
-            "Target": target, 
-            "RSI": curr['RSI'],
-            "ADX": curr['ADX'],
-            "ATR": curr['ATR'],
-            "SMA200": curr['SMA_200'],
-            "EMA20": curr['EMA_20'],
+            "Ticker": ticker, "Status": status, "Price": curr['Close'],
+            "Stop": stop, "Target": target, "RSI": curr['RSI'],
+            "ADX": curr['ADX'], "ATR": curr['ATR'],
+            "SMA200": curr['SMA_200'], "EMA20": curr['EMA_20'],
             "Reason": reason
         }
     return None
@@ -193,11 +169,11 @@ def analyze_stock(ticker, df):
 if st.button("🚀 SCAN 500 STOCKS"):
     
     status_area = st.empty()
-    status_area.write(f"⚠️ Downloading data... (~45s)")
+    status_area.write(f"⚠️ Downloading data for {len(ALL_TICKERS)} stocks... (approx 45s)")
     
     try:
         data = yf.download(ALL_TICKERS, period="2y", group_by='ticker', auto_adjust=True, threads=True)
-        status_area.write("✅ Analyzing...")
+        status_area.write("✅ Data received. Analyzing...")
         
         results = []
         progress_bar = st.progress(0)
@@ -221,20 +197,38 @@ if st.button("🚀 SCAN 500 STOCKS"):
         status_area.empty()
         
         if not results:
-            st.info("No setups found.")
+            st.info("No setups found. Market may be choppy.")
         else:
             st.success(f"Found {len(results)} Opportunities!")
-            results.sort(key=lambda x: (x['Status'] == "WATCH", x['Ticker']))
+            
+            # --- SORTING LOGIC HERE ---
+            # 0 = Top, 1 = Middle, 2 = Bottom
+            def sort_priority(status):
+                if status == "STRONG BUY": return 0
+                if status == "BUY": return 1
+                return 2
+            
+            # Sort by Priority, then by Ticker Name
+            results.sort(key=lambda x: (sort_priority(x['Status']), x['Ticker']))
             
             col1, col2 = st.columns(2)
             
             for i, res in enumerate(results):
-                css = "trade-card" if res['Status'] == "BUY" else "watchlist-card"
-                emoji = "🟢" if res['Status'] == "BUY" else "👀"
+                if res['Status'] == "STRONG BUY":
+                    border_color = "#00E676" # Neon Green
+                    emoji = "🔥"
+                    bg_color = "#1E3A2F" 
+                elif res['Status'] == "BUY":
+                    border_color = "#4CAF50" # Green
+                    emoji = "🟢"
+                    bg_color = "#262730"
+                else:
+                    border_color = "#FFC107" # Yellow
+                    emoji = "👀"
+                    bg_color = "#262730"
                 
-                # Card Header
                 html_card = f"""
-                <div class="{css}">
+                <div style="background-color: {bg_color}; padding: 15px; border-radius: 10px; border-left: 5px solid {border_color}; margin-bottom: 10px;">
                     <h4 style="margin:0; color:white;">{emoji} {res['Ticker']}</h4>
                     <p style="margin:0; color:#ddd; font-size:0.9em;">${res['Price']:.2f}</p>
                     <p style="margin:5px 0; color:#eee; font-weight:bold; font-size:0.8em;">{res['Status']}</p>
@@ -243,30 +237,15 @@ if st.button("🚀 SCAN 500 STOCKS"):
                 
                 with (col1 if i % 2 == 0 else col2):
                     st.markdown(html_card, unsafe_allow_html=True)
-                    
-                    # EXPANDED DETAILS (All Indicators)
                     with st.expander("Show Data"):
-                        # Risk Metrics
-                        st.markdown("**🛑 Risk Plan**")
+                        st.markdown("**🛑 Plan**")
                         st.write(f"Stop: ${res['Stop']:.2f}")
                         st.write(f"Target: ${res['Target']:.2f}")
-                        
+                        st.caption(res['Reason'])
                         st.markdown("---")
-                        
-                        # Technical Metrics
-                        st.markdown("**📊 Indicators**")
-                        st.write(f"**RSI (14):** {res['RSI']:.1f}")
-                        st.write(f"**ADX (Strength):** {res['ADX']:.1f}")
-                        st.write(f"**ATR (Vol):** {res['ATR']:.2f}")
-                        
-                        st.markdown("---")
-                        
-                        # Trend Metrics
-                        st.markdown("**📈 Trend Levels**")
-                        st.write(f"**EMA 20:** ${res['EMA20']:.2f}")
-                        st.write(f"**SMA 200:** ${res['SMA200']:.2f}")
-                        
-                        # Mini Chart
+                        st.markdown("**📊 Stats**")
+                        st.write(f"RSI: {res['RSI']:.1f}")
+                        st.write(f"ADX: {res['ADX']:.1f}")
                         try:
                             df_chart = yf.download(res['Ticker'], period="6mo", interval="1d", progress=False, auto_adjust=True)
                             fig = go.Figure(data=[go.Candlestick(x=df_chart.index,
