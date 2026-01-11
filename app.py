@@ -8,7 +8,7 @@ import datetime
 # -----------------------------------------------------------------------------
 # 1. APP CONFIGURATION
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title="UniAlgo Ultimate", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="UniAlgo Lite", page_icon="⚡", layout="wide")
 
 st.markdown("""
 <style>
@@ -26,11 +26,11 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("⚡ UniAlgo: Multi-Timeframe System")
-st.caption("Daily Swing | Weekly Investing | **NEW: Deep Value (TSX/TSX.V)**")
+st.title("⚡ UniAlgo: Scanner")
+st.caption("Daily Swing (High Frequency) | Deep Value (TSX/V)")
 
 # -----------------------------------------------------------------------------
-# 2. TICKER UNIVERSE (S&P 500 + TSX 60 + TSX VENTURE)
+# 2. TICKER UNIVERSE (S&P 500 + TSX 60 + EXPANDED TSX VENTURE)
 # -----------------------------------------------------------------------------
 
 TSX_TICKERS = [
@@ -44,10 +44,22 @@ TSX_TICKERS = [
     "L.TO", "BIP-UN.TO", "BEP-UN.TO", "H.TO", "FSV.TO"
 ]
 
-# Major TSX Venture Stocks (Manual Selection for speed)
+# EXPANDED TSX VENTURE LIST (Liquid Junior Miners, Tech, Energy)
 TSXV_TICKERS = [
-    "HIVE.V", "BITF.V", "TOI.V", "FOM.V", "NFG.V", "SKE.V", "ISO.V", "LI.V", 
-    "PMET.V", "EU.V", "VZLA.V", "NFG.V", "RECO.V", "GBR.V", "VPT.V", "FD.V"
+    # Tech / Crypto / Growth
+    "TOI.V", "HIVE.V", "BITF.V", "DMGI.V", "VPT.V", "FD.V", "QYOU.V", "DOC.V",
+    "CTS.V", "PYR.V", "FLT.V", "XBC.V", "GRN.V", "HITI.V", "BABY.V",
+    
+    # Mining & Critical Minerals (The bulk of TSX.V)
+    "NFG.V", "PMET.V", "VZLA.V", "ISO.V", "LI.V", "EU.V", "RECO.V", "DSV.V",
+    "GMIN.V", "SKE.V", "FOM.V", "GLA.V", "VGCX.V", "PGM.V", "SGD.V", "NVO.V",
+    "ABRA.V", "ARTG.V", "KNT.V", "LIO.V", "AMX.V", "MAI.V", "ORE.V", "PRYM.V",
+    "SCOT.V", "TIG.V", "WM.V", "UGD.V", "RCK.V", "GBR.V", "DEF.V", "CRE.V",
+    "BTR.V", "CNC.V", "EPL.V", "GWO.V", "III.V", "KNB.V", "MKO.V", "NOB.V",
+    
+    # Energy / Uranium / Lithium
+    "CVV.V", "SYH.V", "FCU.V", "GLO.V", "GXU.V", "LAM.V", "CUR.V", "FUU.V",
+    "UEX.V", "PTU.V", "AZM.V", "BRW.V", "DME.V", "ELBM.V", "LKE.V", "NILI.V"
 ]
 
 US_TICKERS = [
@@ -103,8 +115,7 @@ ALL_TICKERS = TSX_TICKERS + TSXV_TICKERS + US_TICKERS
 def fetch_data():
     return yf.download(ALL_TICKERS, period="2y", group_by='ticker', auto_adjust=True, threads=True)
 
-# DAILY INDICATORS
-def calculate_daily_indicators(df):
+def calculate_indicators(df):
     if df.empty or len(df) < 205: return df
     df = df.copy()
     
@@ -129,133 +140,85 @@ def calculate_daily_indicators(df):
     df['ADX'] = df['ATR'].rolling(14).mean() 
     return df
 
-# WEEKLY INDICATORS
-def convert_and_calculate_weekly(df_daily):
-    if df_daily.empty: return None
-    df_weekly = df_daily.resample('W-FRI').agg({
-        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
-    }).dropna()
-    
-    if len(df_weekly) < 60: return None
-    
-    df_weekly['SMA_50'] = df_weekly['Close'].rolling(window=50).mean()
-    df_weekly['EMA_20'] = df_weekly['Close'].ewm(span=20, adjust=False).mean()
-    
-    delta = df_weekly['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss
-    df_weekly['RSI'] = 100 - (100 / (1 + rs))
-    
-    high_low = df_weekly['High'] - df_weekly['Low']
-    true_range = np.maximum(high_low, np.abs(df_weekly['High'] - df_weekly['Close'].shift()))
-    df_weekly['ATR'] = true_range.rolling(14).mean()
-    
-    return df_weekly
-
 # -----------------------------------------------------------------------------
 # 4. LOGIC ENGINES
 # -----------------------------------------------------------------------------
 
-# DAILY SWING LOGIC
-def analyze_daily_balanced(ticker, df):
+# DAILY SWING LOGIC (ORIGINAL 50% / HIGH FREQUENCY MODE)
+def analyze_daily_original(ticker, df):
     if df.empty or len(df) < 205: return None
     curr = df.iloc[-1]
     prev = df.iloc[-2]
     
+    # 1. Trend Filter
     is_uptrend = (curr['Close'] > curr['SMA_200']) and (curr['ADX'] > 15)
+    
+    # 2. Pullback Filter
     dist = (curr['Close'] - curr['EMA_20']) / curr['EMA_20']
     is_pullback = (abs(dist) < 0.03) and (curr['RSI'] < 60)
     
     if not (is_uptrend and is_pullback): return None
 
+    # 3. Trigger
     avg_vol = df['Volume'].rolling(20).mean().iloc[-1]
     if pd.isna(avg_vol) or avg_vol == 0: avg_vol = 1
     
-    breakout = curr['Close'] > prev['High']
-    vol_ok = curr['Volume'] > (avg_vol * 0.8)
+    is_trigger = (curr['Close'] > prev['High']) or (curr['Close'] > curr['Open'])
+    vol_ok = curr['Volume'] > (avg_vol * 0.7)
     vol_strong = curr['Volume'] > avg_vol
     
     status = "WATCH"
     reason = "Setup Valid"
     
-    if breakout and vol_ok:
+    if is_trigger and vol_ok:
         status = "BUY"
-        reason = "Valid Swing (2x ATR Target)"
-        if (curr['ADX'] > 20) and vol_strong:
+        reason = "Standard Swing Setup"
+        if (curr['ADX'] > 20) and vol_strong and (curr['Close'] > prev['High']):
             status = "STRONG BUY"
-            reason = "🔥 High Conviction Swing"
+            reason = "🔥 High Conviction"
             
     if status != "WATCH":
         stop = curr['Close'] - (2 * curr['ATR'])
-        target = curr['Close'] + (2 * curr['ATR'])
+        target = curr['Close'] + (3 * curr['ATR'])
         return {
             "Ticker": ticker, "Status": status, "Price": curr['Close'],
             "Stop": stop, "Target": target, "RSI": curr['RSI'], "Reason": reason
         }
     return None
 
-# WEEKLY INVESTING LOGIC
-def analyze_weekly(ticker, df_w):
-    if df_w is None: return None
-    curr = df_w.iloc[-1]
-    prev = df_w.iloc[-2]
-    
-    is_uptrend = curr['Close'] > curr['SMA_50']
-    dist = (curr['Close'] - curr['EMA_20']) / curr['EMA_20']
-    is_value = (abs(dist) < 0.03)
-    
-    if not (is_uptrend and is_value): return None
-    
-    trigger = curr['Close'] > prev['High']
-    
-    if trigger:
-        stop = curr['Close'] - (2.5 * curr['ATR'])
-        target = curr['Close'] + (4 * curr['ATR'])
-        return {
-            "Ticker": ticker, "Status": "LONG TERM BUY", "Price": curr['Close'],
-            "Stop": stop, "Target": target, "RSI": curr['RSI'], "Reason": "Weekly Trend Continuation"
-        }
-    return None
-
-# --- NEW: DEEP VALUE / BOTTOM FISHING LOGIC ---
+# DEEP VALUE / BOTTOM FISHING LOGIC
 def analyze_deep_value(ticker, df):
     if df.empty or len(df) < 205: return None
     curr = df.iloc[-1]
-    prev = df.iloc[-2]
     
     # 1. OVERALL WEAKNESS: RSI < 45
     if curr['RSI'] >= 45: return None
     
-    # 2. MARKET CAP PROXY (Liquidity Check)
-    # We use (Price * Volume) > $500k to filter out dead penny stocks
-    # Real market cap checking is too slow for 500 stocks on Streamlit
-    daily_liquidity = curr['Close'] * curr['Volume']
-    if daily_liquidity < 500000: return None
+    # 2. LIQUIDITY (Approx > $500k volume traded today)
+    # Important for TSX.V to avoid 0 volume stocks
+    if (curr['Close'] * curr['Volume']) < 500000: return None
     
-    # 3. BUY MOMENTUM STARTING
-    # Green Candle (Close > Open) AND Volume > 20 Day Avg
+    # 3. MOMENTUM
     avg_vol = df['Volume'].rolling(20).mean().iloc[-1]
     is_green = curr['Close'] > curr['Open']
     has_momentum = (curr['Volume'] > avg_vol) and is_green
     
     if not has_momentum: return None
     
-    # 4. ROCKET FLAG (Deep Discount)
-    # Trading at least 30% below 52-Week High (Price < 0.70 * High)
+    # 4. ROCKET FLAG (>30% discount from 52W High)
     high_52 = curr['52W_High']
     discount = (high_52 - curr['Close']) / high_52
     is_deep_value = discount >= 0.30 
     
     status = "REVERSAL"
-    reason = "RSI < 45 + Vol Buy Signal"
+    reason = "RSI < 45 + Vol Buy"
     
     if is_deep_value:
         status = "ROCKET REVERSAL"
-        reason = "🚀 Deep Discount (>30% off High) + Momentum"
+        reason = "🚀 Deep Discount (>30% off High)"
         
-    stop = curr['Low'] - (1 * curr['ATR']) # Tighter stop for knife catching
-    target = curr['Close'] + (3 * curr['ATR']) # Reversion target
+    stop = curr['Low'] - (1 * curr['ATR'])
+    target = curr['Close'] + (3 * curr['ATR'])
     
     return {
         "Ticker": ticker, "Status": status, "Price": curr['Close'],
@@ -267,12 +230,12 @@ def analyze_deep_value(ticker, df):
 # 5. UI TABS
 # -----------------------------------------------------------------------------
 
-tab1, tab2, tab3, tab4 = st.tabs(["🚀 DAILY SWING", "📅 WEEKLY INVESTING", "🔙 BACKTEST", "💎 BOTTOM FISHING"])
+tab1, tab2 = st.tabs(["🚀 DAILY SWING", "💎 BOTTOM FISHING"])
 
 # === TAB 1: DAILY SCANNER ===
 with tab1:
     st.header("Daily Swing Scanner")
-    st.write("Optimized for **~60% Win Rate** (Targets 2x ATR).")
+    st.write("Original High-Frequency Mode (Targets 3x ATR).")
     
     if st.button("RUN DAILY SCAN", key="scan_d"):
         st.write("⏳ Downloading...")
@@ -284,8 +247,8 @@ with tab1:
             try:
                 if len(ALL_TICKERS)==1: df=data.dropna()
                 else: df=data[ticker].dropna()
-                df = calculate_daily_indicators(df)
-                sig = analyze_daily_balanced(ticker, df)
+                df = calculate_indicators(df)
+                sig = analyze_daily_original(ticker, df)
                 if sig: results.append(sig)
             except: pass
             if i % 25 == 0: prog.progress((i+1)/len(ALL_TICKERS))
@@ -306,14 +269,16 @@ with tab1:
                     with st.expander("Plan"):
                         st.write(f"Stop: ${res['Stop']:.2f}")
                         st.write(f"Target: ${res['Target']:.2f}")
+                        st.write(f"RSI: {res['RSI']:.1f}")
 
-# === TAB 2: WEEKLY SCANNER ===
+# === TAB 2: BOTTOM FISHING ===
 with tab2:
-    st.header("Weekly Investing Scanner")
-    st.write("Long-term holds. Uses **Weekly Candles**.")
+    st.header("💎 Bottom Fishing Scanner (TSX/V)")
+    st.write("Looks for oversold stocks (RSI < 45) with **Volume Momentum**.")
+    st.info("ℹ️ ROCKET 🚀 = Trading at >30% discount from 52-Week High.")
     
-    if st.button("RUN WEEKLY SCAN", key="scan_w"):
-        st.write("⏳ Processing Weekly Data...")
+    if st.button("RUN VALUE SCAN", key="scan_v"):
+        st.write("⏳ Scanning...")
         data = fetch_data()
         results = []
         prog = st.progress(0)
@@ -322,60 +287,34 @@ with tab2:
             try:
                 if len(ALL_TICKERS)==1: df=data.dropna()
                 else: df=data[ticker].dropna()
-                df_w = convert_and_calculate_weekly(df)
-                sig = analyze_weekly(ticker, df_w)
+                
+                df = calculate_indicators(df)
+                sig = analyze_deep_value(ticker, df)
                 if sig: results.append(sig)
             except: pass
             if i % 25 == 0: prog.progress((i+1)/len(ALL_TICKERS))
             
         prog.empty()
         
-        if not results: st.info("No Weekly Setups.")
+        if not results: st.info("No Deep Value plays found.")
         else:
+            results.sort(key=lambda x: (0 if x['Status']=="ROCKET REVERSAL" else 1, x['Ticker']))
             c1, c2 = st.columns(2)
             for i, res in enumerate(results):
-                html = f"""<div style="background-color:#1E2a38; padding:10px; border-left:5px solid #2196F3; margin-bottom:10px;">
-                <b style="color:white;">🗓️ {res['Ticker']}</b><br><span style="color:#ccc">${res['Price']:.2f}</span><br><b style="color:#2196F3">{res['Status']}</b></div>"""
+                if res['Status'] == "ROCKET REVERSAL":
+                    bd, icon, bg = "#E91E63", "🚀", "#381E28"
+                else:
+                    bd, icon, bg = "#9C27B0", "💎", "#262730"
+                
+                html = f"""<div style="background-color:{bg}; padding:10px; border-left:5px solid {bd}; margin-bottom:10px;">
+                <b style="color:white;">{icon} {res['Ticker']}</b><br><span style="color:#ccc">${res['Price']:.2f}</span><br>
+                <b style="color:{bd}">{res['Status']}</b><br>
+                <span style="font-size:0.8em; color:#bbb">Discount: {res['Discount']:.0f}%</span>
+                </div>"""
+                
                 with (c1 if i%2==0 else c2):
                     st.markdown(html, unsafe_allow_html=True)
-                    with st.expander("Investment Plan"):
+                    with st.expander("Catch the Knife"):
                         st.write(f"Stop: ${res['Stop']:.2f}")
                         st.write(f"Target: ${res['Target']:.2f}")
-
-# === TAB 3: BACKTEST ===
-with tab3:
-    st.header("Backtest Simulator (Daily)")
-    st.write("Simulates Daily 'Strong Buys' from last 10 days.")
-    
-    if st.button("RUN SIMULATION", key="sim"):
-        st.write("⏳ calculating...")
-        data = fetch_data()
-        trades = []
-        prog = st.progress(0)
-        
-        for i, ticker in enumerate(ALL_TICKERS):
-            try:
-                if len(ALL_TICKERS)==1: df=data.dropna()
-                else: df=data[ticker].dropna()
-                df = calculate_daily_indicators(df)
-                
-                for j in range(-10, -1):
-                    curr = df.iloc[j]
-                    prev = df.iloc[j-1]
-                    future = df.iloc[j+1:]
-                    
-                    uptrend = (curr['Close'] > curr['SMA_200']) and (curr['ADX'] > 15)
-                    pullback = (abs((curr['Close']-curr['EMA_20'])/curr['EMA_20']) < 0.03)
-                    trigger = (curr['Close'] > prev['High']) and (curr['Volume'] > df['Volume'].rolling(20).mean().iloc[j] * 0.8)
-                    
-                    if uptrend and pullback and trigger:
-                        entry = curr['Close']
-                        stop = entry - (2*curr['ATR'])
-                        target = entry + (2*curr['ATR'])
-                        outcome="OPEN"; exit_p=df.iloc[-1]['Close']
-                        
-                        for _, row in future.iterrows():
-                            if row['Low'] < stop: outcome="STOPPED"; exit_p=stop; break
-                            if row['High'] > target: outcome="TARGET"; exit_p=target; break
-                        
-                        trades.append({"Ticker":ticker, "Entry":entry, "Exit":exit_p, "Outcome":outcome, "Return %":
+                        st.write(f"RSI: {res['RSI']:.1f}")
